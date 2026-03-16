@@ -69,6 +69,15 @@ def run_episode(
     """
     Run one episode and return a list of (agent_arr, patch_arr, counts) tuples,
     one per timestep (including step 0).
+
+    Slot assignment is entity-consistent: each unique agent is assigned a fixed
+    slot index (sorted by entity_id) that it occupies for its entire lifetime.
+    When an agent dies its slot is left as all-zeros (alive=0) in subsequent
+    snapshots.  This guarantees that column i in agent_arr[t] and agent_arr[t+1]
+    always refer to the same individual, making BCE and delta targets meaningful.
+
+    Agents born after the n_max_agents capacity is reached are silently dropped
+    (oldest agents take priority).
     """
     model = EcosystemModel(
         sim_cfg=sim_cfg,
@@ -79,11 +88,59 @@ def run_episode(
     )
     snapshots = model.run(data_cfg.episode_length)
 
+    # ── Build entity → slot mapping for this episode ──────────────────────
+    # Collect every entity_id that appears in any snapshot, in first-seen order.
+    # Sorting by entity_id (which increments with spawn order) keeps older agents
+    # in lower slots and is fully deterministic.
+    seen: set = set()
+    all_ids: List[int] = []
+    for s in snapshots:
+        for a in s["agents"]:
+            uid = a["entity_id"]
+            if uid not in seen:
+                seen.add(uid)
+                all_ids.append(uid)
+
+    n_max = sim_cfg.n_max_agents
+    kept_ids = sorted(all_ids)[:n_max]          # oldest n_max agents by spawn order
+    id_to_slot: dict = {uid: i for i, uid in enumerate(kept_ids)}
+
     W = sim_cfg.grid_width
     H = sim_cfg.grid_height
-    n_max = sim_cfg.n_max_agents
+    n_patches = W * H
 
-    return [snapshot_to_arrays(s, n_max, W, H) for s in snapshots]
+    result: List[Tuple] = []
+    for s in snapshots:
+        # Agent array — zero-initialised; dead / overflow slots stay as zeros
+        agent_arr = np.zeros((n_max, 6), dtype=np.float32)
+        for a in s["agents"]:
+            slot = id_to_slot.get(a["entity_id"])
+            if slot is None:
+                continue   # born after capacity was reached — skip
+            agent_arr[slot] = [
+                a["species"], a["x"], a["y"],
+                a["energy"], a["age"], a["alive"],
+            ]
+
+        # Patch array (fixed size, no identity tracking needed)
+        patch_arr = np.zeros((n_patches, 4), dtype=np.float32)
+        for j, p in enumerate(s["patches"][:n_patches]):
+            patch_arr[j] = [p["x"], p["y"], p["energy"], p["alive"]]
+
+        # Global counts (reflect true simulation population, may exceed n_max)
+        n_prey_c = sum(
+            1 for a in s["agents"]
+            if a["species"] == SPECIES_PREY and a["alive"] > 0.5
+        )
+        n_pred_c = sum(
+            1 for a in s["agents"]
+            if a["species"] == SPECIES_PREDATOR and a["alive"] > 0.5
+        )
+        counts = np.array([n_prey_c, n_pred_c], dtype=np.int32)
+
+        result.append((agent_arr, patch_arr, counts))
+
+    return result
 
 
 # ── Dataset builder ──────────────────────────────────────────────────────────

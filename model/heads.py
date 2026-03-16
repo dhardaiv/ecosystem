@@ -57,17 +57,19 @@ class FoodCEHead(nn.Module):
 
 class AuxHead(nn.Module):
     """
-    Predicts global [n_prey, n_pred] counts via differentiable sum over
-    alive-probability-weighted token representations.
+    Predicts global [n_prey, n_pred] counts as normalised fractions in [0, 1].
 
-    The aux head never needs gradients to flow through hard alive masks
-    (it uses soft probabilities from the BCE head).
+    Output is sigmoid-constrained so predictions are always in a valid range
+    and the supervision signal is commensurate with other loss terms (~[0,1]).
+    Mean pooling (not sum) over alive-weighted tokens decouples the
+    representation from raw population size, preventing the head from learning
+    a shortcut that scales with agent count.
     """
-    def __init__(self, d_model: int):
+    def __init__(self, d_model: int, n_max: int):
         super().__init__()
-        # Small MLP: pool alive-weighted tokens → scalar count predictions
-        self.prey_head  = nn.Linear(d_model, 1)
-        self.pred_head  = nn.Linear(d_model, 1)
+        self.n_max = n_max
+        self.prey_head = nn.Linear(d_model, 1)
+        self.pred_head = nn.Linear(d_model, 1)
 
     def forward(
         self,
@@ -78,29 +80,32 @@ class AuxHead(nn.Module):
         """
         Returns
         -------
-        n_prey_hat : (B,) float — predicted prey count
-        n_pred_hat : (B,) float — predicted predator count
+        n_hat_prey_norm : (B,) float in [0, 1] — predicted prey count / n_max
+        n_hat_pred_norm : (B,) float in [0, 1] — predicted predator count / n_max
         """
-        is_prey = (species == 0).float()     # (B, N_agents)
+        is_prey = (species == 0).float()   # (B, N_agents)
         is_pred = (species == 1).float()
 
-        # Weighted hidden representations
-        prey_hidden = hidden * (alive_probs * is_prey).unsqueeze(-1)   # (B, N, D)
-        pred_hidden = hidden * (alive_probs * is_pred).unsqueeze(-1)
+        prey_w = alive_probs * is_prey     # soft alive-and-species weight
+        pred_w = alive_probs * is_pred
 
-        # Differentiable sum (like counting alive-weighted tokens)
-        # Use a learned linear head on the pooled representation,
-        # plus a direct count from the alive probabilities as a residual.
-        prey_pool = prey_hidden.sum(dim=1)           # (B, D)
-        pred_pool = pred_hidden.sum(dim=1)
+        # Mean-pool: divide by soft agent count so representation is
+        # independent of population size (fixes sum-pool scaling pathology).
+        prey_denom = prey_w.sum(dim=1, keepdim=True).clamp(min=1.0)
+        pred_denom = pred_w.sum(dim=1, keepdim=True).clamp(min=1.0)
 
-        prey_count_direct = (alive_probs * is_prey).sum(dim=1)   # (B,)
-        pred_count_direct = (alive_probs * is_pred).sum(dim=1)
+        prey_repr = (hidden * prey_w.unsqueeze(-1)).sum(dim=1) / prey_denom  # (B, D)
+        pred_repr = (hidden * pred_w.unsqueeze(-1)).sum(dim=1) / pred_denom
 
-        n_prey = self.prey_head(prey_pool).squeeze(-1) + prey_count_direct
-        n_pred = self.pred_head(pred_pool).squeeze(-1) + pred_count_direct
+        # Sigmoid constrains output to (0, 1) — same scale as other loss terms.
+        n_hat_prey_norm = torch.sigmoid(self.prey_head(prey_repr)).squeeze(-1)  # (B,)
+        n_hat_pred_norm = torch.sigmoid(self.pred_head(pred_repr)).squeeze(-1)
 
-        return n_prey, n_pred
+        return n_hat_prey_norm, n_hat_pred_norm
+
+    def to_counts(self, n_hat_norm: torch.Tensor) -> torch.Tensor:
+        """Convert normalised prediction back to an interpretable count (logging only)."""
+        return (n_hat_norm * self.n_max).round()
 
 
 # ── Full Output Module ────────────────────────────────────────────────────────
@@ -120,7 +125,7 @@ class WorldModelHeads(nn.Module):
         self.mse_head   = MSEHead(D)
         self.bce_head   = BCEHead(D)
         self.food_head  = FoodCEHead(D, n_bins=model_cfg.n_food_bins)
-        self.aux_head   = AuxHead(D)
+        self.aux_head   = AuxHead(D, n_max=model_cfg.n_max_agents)
 
     def forward(
         self,
@@ -184,12 +189,16 @@ def compute_loss(
 
     food_t1 = patches_t1[..., 2]       # (B, N_patches) ground truth food level
 
-    n_prey_gt = counts_t1[:, 0].float()   # (B,)
-    n_pred_gt = counts_t1[:, 1].float()   # (B,)
+    N_max = float(model_cfg.n_max_agents)
+    # Normalise ground-truth counts to [0, 1] so L_aux is commensurate with
+    # other loss terms.  Predictions from AuxHead are already sigmoid-bounded.
+    n_prey_gt = counts_t1[:, 0].float() / N_max   # (B,)
+    n_pred_gt = counts_t1[:, 1].float() / N_max   # (B,)
 
-    # ── L_mse (alive agents only) ─────────────────────────────────────────
-    # Apply alive_mask_t: only agents alive at t contribute to delta loss
-    m = alive_mask_t                             # (B, N_agents)
+    # ── L_mse (agents alive at BOTH t and t+1) ───────────────────────────
+    # Mask to agents alive at t AND t+1: dying agents have garbage delta
+    # targets (slot zeros out at t+1), so they must be excluded.
+    m = alive_mask_t * alive_mask_t1             # (B, N_agents)
     denom_mse = m.sum().clamp(min=1.0)
     sq_err = ((delta_pred - delta_gt) ** 2).sum(-1)   # (B, N_agents)
     L_mse = (m * sq_err).sum() / denom_mse
@@ -225,14 +234,41 @@ def compute_loss(
     )
 
     # ── L_aux (global population counts) ─────────────────────────────────
-    L_aux = ((n_prey_hat - n_prey_gt) ** 2 + (n_pred_hat - n_pred_gt) ** 2).mean()
+    # Guard: skip computation entirely in phase 1 (lambda_aux == 0).
+    # Multiplying by zero does NOT prevent NaN/inf gradients in PyTorch when
+    # the forward pass itself is ill-conditioned — guard with an explicit check.
+    if train_cfg.lambda_aux > 0:
+        L_aux = (
+            F.mse_loss(n_prey_hat, n_prey_gt)
+            + F.mse_loss(n_pred_hat, n_pred_gt)
+        )
+    else:
+        L_aux = torch.zeros((), device=device)
+
+    # ── L_var_reg (movement entropy regularizer) ──────────────────────────
+    # Penalise near-zero variance of predicted position deltas across alive
+    # agents in the batch — breaks the zero-delta attractor.
+    if train_cfg.delta_var_reg > 0:
+        alive_bool = m.bool()                          # (B, N_agents)
+        pos_deltas = delta_pred[..., :2]               # (B, N_agents, 2) — Δx, Δy only
+        alive_pos_deltas = pos_deltas[alive_bool]      # (N_alive, 2)
+        if alive_pos_deltas.shape[0] > 1:
+            batch_var = alive_pos_deltas.var(dim=0).mean()
+            L_var_reg = F.relu(
+                torch.tensor(train_cfg.delta_var_threshold, device=device) - batch_var
+            )
+        else:
+            L_var_reg = delta_pred.new_zeros(())
+    else:
+        L_var_reg = delta_pred.new_zeros(())
 
     # ── Weighted total ────────────────────────────────────────────────────
     L_total = (
-        train_cfg.lambda_mse * L_mse
-      + train_cfg.lambda_bce * L_bce
-      + train_cfg.lambda_ce  * L_ce
-      + train_cfg.lambda_aux * L_aux
+        train_cfg.lambda_mse    * L_mse
+      + train_cfg.lambda_bce    * L_bce
+      + train_cfg.lambda_ce     * L_ce
+      + train_cfg.lambda_aux    * L_aux
+      + train_cfg.delta_var_reg * L_var_reg
     )
 
     return {
@@ -241,5 +277,6 @@ def compute_loss(
         "loss_bce":     L_bce.detach(),
         "loss_ce":      L_ce.detach(),
         "loss_aux":     L_aux.detach(),
-        "loss_total_for_backward": L_total,  # aliased for clarity
+        "loss_var_reg": L_var_reg.detach(),
+        "loss_total_for_backward": L_total,
     }

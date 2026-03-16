@@ -96,6 +96,51 @@ def load_episodes(path: str) -> list:
         return pickle.load(f)
 
 
+def compute_death_rate(episodes: list) -> dict:
+    """
+    Audit the fraction of (s_t, s_{t+1}) pairs that contain at least one death
+    event, and the per-slot death probability across the full dataset.
+
+    A death event is: alive at t (col 5 == 1) AND dead at t+1 (col 5 == 0).
+
+    Returns
+    -------
+    dict with keys:
+      n_pairs                    — total transition pairs examined
+      n_pairs_with_death         — pairs where ≥1 agent dies
+      fraction_pairs_with_death  — above as a fraction
+      total_death_events         — sum of individual death events
+      total_alive_at_t           — sum of alive agent-slots at t
+      per_slot_death_rate        — death events / alive slots (death probability per step)
+    """
+    n_pairs = 0
+    n_pairs_with_death = 0
+    total_death_events = 0
+    total_alive_at_t = 0
+
+    for episode in episodes:
+        for t in range(len(episode) - 1):
+            agents_t,  _, _ = episode[t]
+            agents_t1, _, _ = episode[t + 1]
+            alive_t  = agents_t[:, 5]
+            alive_t1 = agents_t1[:, 5]
+            deaths = ((alive_t == 1) & (alive_t1 == 0)).sum()
+            n_pairs += 1
+            if deaths > 0:
+                n_pairs_with_death += 1
+            total_death_events += int(deaths)
+            total_alive_at_t   += int((alive_t == 1).sum())
+
+    return {
+        "n_pairs":                    n_pairs,
+        "n_pairs_with_death":         n_pairs_with_death,
+        "fraction_pairs_with_death":  n_pairs_with_death / max(n_pairs, 1),
+        "total_death_events":         total_death_events,
+        "total_alive_at_t":           total_alive_at_t,
+        "per_slot_death_rate":        total_death_events / max(total_alive_at_t, 1),
+    }
+
+
 def make_dataloaders(
     data_dir: str = DATA.data_dir,
     batch_size: int = 32,

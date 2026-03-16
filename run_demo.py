@@ -81,7 +81,8 @@ TRAIN_CFG = TrainConfig(
     batch_size=16,
     n_epochs=20,
     grad_clip=1.0,
-    scheduled_sampling_rate=0.0,
+    ss_rate_init=0.0,
+    ss_rate_max=0.50,
     ss_rate_increment=0.01,
     alive_noise_rate=0.05,
     phase2_epoch=10,
@@ -215,6 +216,9 @@ def train_epoch(epoch):
         losses = compute_loss(preds, agents_t, agents_t1, patches_t1, counts_t1, TRAIN_CFG, MODEL_CFG)
         losses["loss_total"].backward()
         nn.utils.clip_grad_norm_(world_model.parameters(), TRAIN_CFG.grad_clip)
+        nn.utils.clip_grad_norm_(
+            world_model.heads.aux_head.parameters(), TRAIN_CFG.grad_clip_aux
+        )
         optimizer.step()
 
         train_log.append((

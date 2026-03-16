@@ -61,7 +61,7 @@ class Trainer:
 
         self.global_step = 0
         self.best_val_loss = float("inf")
-        self.ss_rate = train_cfg.scheduled_sampling_rate
+        self.ss_rate = train_cfg.ss_rate_init   # non-zero from epoch 1
         self.current_phase = 1
         self.rollout_k = train_cfg.rollout_k_start
 
@@ -174,16 +174,22 @@ class Trainer:
 
     def train_epoch(self, epoch: int) -> dict:
         self.model.train()
-        accum = {k: 0.0 for k in ["loss_total", "loss_mse", "loss_bce", "loss_ce", "loss_aux"]}
+        accum = {k: 0.0 for k in ["loss_total", "loss_mse", "loss_bce", "loss_ce", "loss_aux", "loss_var_reg"]}
         n_batches = 0
 
-        use_rollout = self.current_phase >= 3
-        k = min(self.rollout_k, self.cfg.rollout_k_max) if use_rollout else 1
+        # Use multi-step whenever ss_rate > 0 (scheduled sampling active),
+        # even in phases 1 and 2.  In phase 3 rollout_k grows up to k_max;
+        # earlier phases use a fixed k=2 to expose the model to its own errors.
+        use_rollout = self.ss_rate > 0 or self.current_phase >= 3
+        if self.current_phase >= 3:
+            k = min(self.rollout_k, self.cfg.rollout_k_max)
+        else:
+            k = 2  # minimal 2-step window for early scheduled sampling
 
         for batch in self.train_loader:
             self.optimizer.zero_grad()
 
-            if use_rollout and k > 1:
+            if use_rollout:
                 losses, preds, alive_t = self._forward_multistep(batch, k)
             else:
                 losses, preds, alive_t = self._forward_single(batch)
@@ -194,22 +200,35 @@ class Trainer:
             grad_norm = nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.cfg.grad_clip
             )
+            # Tighter clip on aux head to prevent early-training population
+            # count gradients from overwhelming the shared transformer weights.
+            nn.utils.clip_grad_norm_(
+                self.model.heads.aux_head.parameters(),
+                self.cfg.grad_clip_aux,
+            )
 
             self.optimizer.step()
 
             # ── per-step wandb log ─────────────────────────────────────────
             alive_frac = alive_t.mean().item()
+            aux_grad_norm = sum(
+                p.grad.norm().item() ** 2
+                for p in self.model.heads.aux_head.parameters()
+                if p.grad is not None
+            ) ** 0.5
             wandb.log({
-                "train/loss_total":  losses["loss_total"].item(),
-                "train/loss_mse":    losses["loss_mse"].item(),
-                "train/loss_bce":    losses["loss_bce"].item(),
-                "train/loss_ce":     losses["loss_ce"].item(),
-                "train/loss_aux":    losses["loss_aux"].item(),
-                "train/alive_frac":  alive_frac,
-                "train/grad_norm":   grad_norm.item(),
-                "train/ss_rate":     self.ss_rate,
-                "train/phase":       self.current_phase,
-                "step":              self.global_step,
+                "train/loss_total":    losses["loss_total"].item(),
+                "train/loss_mse":      losses["loss_mse"].item(),
+                "train/loss_bce":      losses["loss_bce"].item(),
+                "train/loss_ce":       losses["loss_ce"].item(),
+                "train/loss_aux":      losses["loss_aux"].item(),
+                "train/loss_var_reg":  losses["loss_var_reg"].item(),
+                "train/alive_frac":    alive_frac,
+                "train/grad_norm":     grad_norm.item(),
+                "train/grad_norm_aux": aux_grad_norm,
+                "train/ss_rate":       self.ss_rate,
+                "train/phase":         self.current_phase,
+                "step":                self.global_step,
             })
 
             for k_name in accum:
@@ -226,7 +245,7 @@ class Trainer:
     def val_epoch(self, epoch: int) -> dict:
         self.model.eval()
         from sklearn.metrics import f1_score
-        accum = {k: 0.0 for k in ["loss_total", "loss_mse", "loss_bce", "loss_ce", "loss_aux"]}
+        accum = {k: 0.0 for k in ["loss_total", "loss_mse", "loss_bce", "loss_ce", "loss_aux", "loss_var_reg"]}
         pos_mse_sum = 0.0
         energy_mse_sum = 0.0
         alive_acc_sum = 0.0
@@ -289,6 +308,7 @@ class Trainer:
             "val/loss_bce":       metrics["loss_bce"],
             "val/loss_ce":        metrics["loss_ce"],
             "val/loss_aux":       metrics["loss_aux"],
+            "val/loss_var_reg":   metrics["loss_var_reg"],
             "val/position_mse":   metrics["val/position_mse"],
             "val/energy_mse":     metrics["val/energy_mse"],
             "val/alive_accuracy": metrics["val/alive_accuracy"],
@@ -339,16 +359,16 @@ class Trainer:
         for epoch in range(1, self.cfg.n_epochs + 1):
             self._update_phase(epoch)
 
-            # Increase scheduled sampling rate each epoch
+            # ss_rate grows every epoch from the start, capped at ss_rate_max
+            self.ss_rate = min(
+                self.cfg.ss_rate_max,
+                self.ss_rate + self.cfg.ss_rate_increment,
+            )
             if self.current_phase >= 3:
-                self.ss_rate = min(
-                    1.0, self.ss_rate + self.cfg.ss_rate_increment
+                self.rollout_k = min(
+                    self.cfg.rollout_k_max,
+                    self.cfg.rollout_k_start + (epoch - self.cfg.phase3_epoch) // 5,
                 )
-                if self.current_phase == 3:
-                    self.rollout_k = min(
-                        self.cfg.rollout_k_max,
-                        self.cfg.rollout_k_start + (epoch - self.cfg.phase3_epoch) // 5
-                    )
 
             train_metrics = self.train_epoch(epoch)
 

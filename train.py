@@ -18,7 +18,7 @@ import wandb
 
 from config import MODEL, TRAIN, DATA, all_configs_as_dict
 from model import EcosystemWorldModel
-from data.dataset import make_dataloaders, load_episodes
+from data.dataset import make_dataloaders, load_episodes, compute_death_rate
 from training.trainer import Trainer
 
 
@@ -52,8 +52,10 @@ def main():
         "lambda_aux": TRAIN.lambda_aux,
         "lr":         TRAIN.lr,
         "batch_size": TRAIN.batch_size,
-        "scheduled_sampling_rate": TRAIN.scheduled_sampling_rate,
-        "alive_noise_rate":        TRAIN.alive_noise_rate,
+        "ss_rate_init":      TRAIN.ss_rate_init,
+        "ss_rate_max":       TRAIN.ss_rate_max,
+        "delta_var_reg":     TRAIN.delta_var_reg,
+        "alive_noise_rate":  TRAIN.alive_noise_rate,
         "phase": 1,
     })
 
@@ -72,6 +74,22 @@ def main():
 
     val_episodes_path = os.path.join(args.data_dir, "val.pkl")
     val_episodes = load_episodes(val_episodes_path) if os.path.exists(val_episodes_path) else None
+
+    # ── Death-rate audit ──────────────────────────────────────────────
+    train_episodes_path = os.path.join(args.data_dir, "train.pkl")
+    if os.path.exists(train_episodes_path):
+        train_eps_raw = load_episodes(train_episodes_path)
+        dr = compute_death_rate(train_eps_raw)
+        print(
+            f"[Death-rate audit] pairs={dr['n_pairs']:,} | "
+            f"pairs_with_death={dr['n_pairs_with_death']:,} "
+            f"({dr['fraction_pairs_with_death']:.1%}) | "
+            f"per-slot death rate={dr['per_slot_death_rate']:.4f}"
+        )
+        wandb.config.update({
+            "data/fraction_pairs_with_death": dr["fraction_pairs_with_death"],
+            "data/per_slot_death_rate":       dr["per_slot_death_rate"],
+        }, allow_val_change=True)
 
     # ── Model ─────────────────────────────────────────────────────────────
     model = EcosystemWorldModel(MODEL)

@@ -74,12 +74,16 @@ class TrainConfig:
     """Training loop hyperparameters."""
     # Loss weights
     lambda_mse: float = 1.0
-    lambda_bce: float = 2.0
+    lambda_bce: float = 5.0             # raised from 2.0 — harder signal on dead class
     lambda_ce: float = 0.5
     lambda_aux: float = 0.0             # 0 during phase 1
 
     # Dead-class upweighting in BCE
     bce_dead_weight: float = 10.0
+
+    # Movement entropy regularizer (penalises near-zero delta variance)
+    delta_var_reg: float = 0.01         # weight on L_var_reg
+    delta_var_threshold: float = 1e-4   # variance floor; penalty = relu(threshold - var)
 
     # Optimiser
     lr: float = 3e-4
@@ -87,10 +91,12 @@ class TrainConfig:
     batch_size: int = 32
     n_epochs: int = 100
     grad_clip: float = 1.0
+    grad_clip_aux: float = 0.1      # tighter clip applied to aux head only
 
     # Scheduled sampling (teacher-forcing → self-rollout)
-    scheduled_sampling_rate: float = 0.0  # starts at 0, increases each epoch
-    ss_rate_increment: float = 0.01       # added to ss_rate each epoch
+    ss_rate_init: float = 0.10          # non-zero from epoch 1
+    ss_rate_max: float = 0.50           # cap — never fully discard ground truth
+    ss_rate_increment: float = 0.01     # added to ss_rate each epoch
 
     # Alive mask noise injection
     alive_noise_rate: float = 0.05
