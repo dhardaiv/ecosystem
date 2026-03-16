@@ -73,7 +73,8 @@ class ModelConfig:
 class TrainConfig:
     """Training loop hyperparameters."""
     # Loss weights
-    lambda_mse: float = 1.0
+    lambda_move: float = 1.0            # movement cross-entropy
+    lambda_energy: float = 1.0          # energy delta MSE
     lambda_bce: float = 5.0             # raised from 2.0 — harder signal on dead class
     lambda_ce: float = 0.5
     lambda_aux: float = 0.0             # 0 during phase 1
@@ -81,9 +82,12 @@ class TrainConfig:
     # Dead-class upweighting in BCE
     bce_dead_weight: float = 10.0
 
-    # Movement entropy regularizer (penalises near-zero delta variance)
-    delta_var_reg: float = 0.01         # weight on L_var_reg
-    delta_var_threshold: float = 1e-4   # variance floor; penalty = relu(threshold - var)
+    # Energy variance penalty (penalises near-zero Δenergy variance across batch)
+    energy_var_reg: float = 0.1         # weight on variance penalty term
+    energy_var_threshold: float = 0.001 # var floor; penalty = relu(threshold - var)
+
+    # Movement sampling temperature (used at rollout time; 1.0 = argmax-equivalent default)
+    movement_temperature: float = 1.0
 
     # Optimiser
     lr: float = 3e-4

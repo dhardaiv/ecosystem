@@ -14,6 +14,7 @@ import time
 from typing import Optional, List
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -160,7 +161,10 @@ class Trainer:
             # Determine next input: use GT or model prediction (scheduled sampling)
             use_model = torch.rand(1).item() < self.ss_rate
             if use_model and step_i < k - 1:
-                agents, patches = apply_predictions_to_state(agents, patches, preds)
+                agents, patches = apply_predictions_to_state(
+                    agents, patches, preds,
+                    grid_size=self.mcfg.grid_size, soft=True,
+                )
             else:
                 agents  = agents_t1.clone()
                 patches = patches_t1.clone()
@@ -174,7 +178,7 @@ class Trainer:
 
     def train_epoch(self, epoch: int) -> dict:
         self.model.train()
-        accum = {k: 0.0 for k in ["loss_total", "loss_mse", "loss_bce", "loss_ce", "loss_aux", "loss_var_reg"]}
+        accum = {k: 0.0 for k in ["loss_total", "loss_movement", "loss_energy", "loss_bce", "loss_ce", "loss_aux"]}
         n_batches = 0
 
         # Use multi-step whenever ss_rate > 0 (scheduled sampling active),
@@ -217,18 +221,20 @@ class Trainer:
                 if p.grad is not None
             ) ** 0.5
             wandb.log({
-                "train/loss_total":    losses["loss_total"].item(),
-                "train/loss_mse":      losses["loss_mse"].item(),
-                "train/loss_bce":      losses["loss_bce"].item(),
-                "train/loss_ce":       losses["loss_ce"].item(),
-                "train/loss_aux":      losses["loss_aux"].item(),
-                "train/loss_var_reg":  losses["loss_var_reg"].item(),
-                "train/alive_frac":    alive_frac,
-                "train/grad_norm":     grad_norm.item(),
-                "train/grad_norm_aux": aux_grad_norm,
-                "train/ss_rate":       self.ss_rate,
-                "train/phase":         self.current_phase,
-                "step":                self.global_step,
+                "train/loss_total":           losses["loss_total"].item(),
+                "train/loss_movement":        losses["loss_movement"].item(),
+                "train/loss_energy":          losses["loss_energy"].item(),
+                "train/loss_bce":             losses["loss_bce"].item(),
+                "train/loss_ce":              losses["loss_ce"].item(),
+                "train/loss_aux":             losses["loss_aux"].item(),
+                "train/movement_entropy":     losses["movement_entropy"],
+                "train/frac_stay_predicted":  losses["frac_stay_predicted"],
+                "train/alive_frac":           alive_frac,
+                "train/grad_norm":            grad_norm.item(),
+                "train/grad_norm_aux":        aux_grad_norm,
+                "train/ss_rate":              self.ss_rate,
+                "train/phase":                self.current_phase,
+                "step":                       self.global_step,
             })
 
             for k_name in accum:
@@ -245,12 +251,18 @@ class Trainer:
     def val_epoch(self, epoch: int) -> dict:
         self.model.eval()
         from sklearn.metrics import f1_score
-        accum = {k: 0.0 for k in ["loss_total", "loss_mse", "loss_bce", "loss_ce", "loss_aux", "loss_var_reg"]}
+        import numpy as np
+        from training.utils import DIRECTION_VECS
+
+        accum = {k: 0.0 for k in ["loss_total", "loss_movement", "loss_energy", "loss_bce", "loss_ce", "loss_aux"]}
         pos_mse_sum = 0.0
         energy_mse_sum = 0.0
         alive_acc_sum = 0.0
         all_alive_true, all_alive_pred = [], []
         n_batches = 0
+
+        dir_vecs = DIRECTION_VECS.to(self.device)   # (9, 2)
+        step_norm = 1.0 / self.mcfg.grid_size
 
         for batch in self.val_loader:
             agents_t   = batch["agents_t"].to(self.device)
@@ -270,15 +282,18 @@ class Trainer:
                 accum[k_name] += (val_to_add.item() if hasattr(val_to_add, 'item') else float(val_to_add))
 
             # Position MSE (x, y only, alive at t)
-            alive_t = agents_t[:, :, 5]
-            pos_t1_pred = agents_t[:, :, 1:3] + preds["delta_pred"][:, :, :2]
+            # Use soft expected direction to reconstruct predicted next position
+            alive_t   = agents_t[:, :, 5]
+            move_probs = F.softmax(preds["movement_logits"], dim=-1)   # (B, N_a, 9)
+            dx_dy_soft = (move_probs.unsqueeze(-1) * dir_vecs).sum(-2) # (B, N_a, 2)
+            pos_t1_pred = agents_t[:, :, 1:3] + dx_dy_soft * step_norm
             pos_t1_gt   = agents_t1[:, :, 1:3]
             pos_mse = ((pos_t1_pred - pos_t1_gt) ** 2).sum(-1)
             denom = alive_t.sum().clamp(min=1.0)
             pos_mse_sum += (alive_t * pos_mse).sum().item() / denom.item()
 
             # Energy MSE
-            en_t1_pred = agents_t[:, :, 3] + preds["delta_pred"][:, :, 2]
+            en_t1_pred = agents_t[:, :, 3] + preds["energy_delta"]
             en_t1_gt   = agents_t1[:, :, 3]
             en_mse = (en_t1_pred - en_t1_gt) ** 2
             energy_mse_sum += (alive_t * en_mse).sum().item() / denom.item()
@@ -292,23 +307,22 @@ class Trainer:
 
             n_batches += 1
 
-        import numpy as np
         alive_f1 = f1_score(all_alive_true, all_alive_pred, pos_label=0,
-                            zero_division=0)  # F1 on dead class
+                            zero_division=0)
 
         metrics = {k: v / max(n_batches, 1) for k, v in accum.items()}
-        metrics["val/position_mse"]  = pos_mse_sum / max(n_batches, 1)
-        metrics["val/energy_mse"]    = energy_mse_sum / max(n_batches, 1)
+        metrics["val/position_mse"]   = pos_mse_sum / max(n_batches, 1)
+        metrics["val/energy_mse"]     = energy_mse_sum / max(n_batches, 1)
         metrics["val/alive_accuracy"] = alive_acc_sum / max(n_batches, 1)
         metrics["val/alive_f1"]       = alive_f1
 
         wandb.log({
             "val/loss_total":     metrics["loss_total"],
-            "val/loss_mse":       metrics["loss_mse"],
+            "val/loss_movement":  metrics["loss_movement"],
+            "val/loss_energy":    metrics["loss_energy"],
             "val/loss_bce":       metrics["loss_bce"],
             "val/loss_ce":        metrics["loss_ce"],
             "val/loss_aux":       metrics["loss_aux"],
-            "val/loss_var_reg":   metrics["loss_var_reg"],
             "val/position_mse":   metrics["val/position_mse"],
             "val/energy_mse":     metrics["val/energy_mse"],
             "val/alive_accuracy": metrics["val/alive_accuracy"],

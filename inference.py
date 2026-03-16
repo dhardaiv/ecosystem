@@ -196,7 +196,8 @@ def run_inference(
 
             # Advance state
             agents_t, patches_t = apply_predictions_to_state(
-                agents_t, patches_t, preds, threshold
+                agents_t, patches_t, preds, threshold,
+                grid_size=sim_cfg.grid_size,
             )
 
     # ── Summary trajectory chart ──────────────────────────────────────────

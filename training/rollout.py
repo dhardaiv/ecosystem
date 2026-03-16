@@ -13,8 +13,14 @@ Metrics logged:
   rollout/energy_kl_t20          — KL divergence of energy distributions at step 20
   rollout/stability_rate         — fraction of rollouts with non-zero, non-exploding pop
   rollout/mean_ghost_count       — mean ghost agents per step
+  rollout/mean_prey_spatial_spread  — mean prey spatial spread across rollout steps
+  rollout/mean_pred_spatial_spread  — mean predator spatial spread across rollout steps
   rollout/trajectory             — population trajectory chart (for one random episode)
   rollout/attention_map          — attention weight heatmap from last transformer layer
+
+Spatial spread health threshold: > 0.15 on a normalised 20×20+ grid.
+If spread drops below 0.05 within the first 5 steps, the movement head is
+still collapsing — raise lambda_move or add label smoothing.
 """
 import math
 from typing import Optional, List
@@ -37,6 +43,7 @@ def rollout_episode(
     episode: List[tuple],           # list of (agent_arr, patch_arr, counts)
     horizon: int,
     device: torch.device,
+    model_cfg: ModelConfig,
     threshold: float = 0.5,
 ) -> dict:
     """
@@ -44,15 +51,17 @@ def rollout_episode(
 
     Returns
     -------
-    pred_prey   : (horizon,)  predicted prey counts
-    pred_pred   : (horizon,)  predicted predator counts
-    true_prey   : (horizon,)  ground truth prey counts
-    true_pred   : (horizon,)  ground truth predator counts
-    ghost_counts: (horizon,)  ghost agents per step (p>0.5 but GT dead)
-    attn_last   : final attention weight matrix (H, N, N) or None
-    pred_agents : list of (N_a,) arrays — alive masks per rollout step
-    pred_xy     : list of (N_a, 2) arrays — predicted positions per step
-    pred_energy : list of (N_a,) arrays — predicted energy per step
+    pred_prey            : (horizon,)    predicted prey counts
+    pred_pred            : (horizon,)    predicted predator counts
+    true_prey            : (horizon,)    ground truth prey counts
+    true_pred            : (horizon,)    ground truth predator counts
+    ghost_counts         : (horizon,)    ghost agents per step (p>0.5 but GT dead)
+    attn_last            : final attention weight matrix (H, N, N) or None
+    pred_agents          : list of (N_a,) arrays — alive masks per rollout step
+    pred_xy              : list of (N_a, 2) arrays — predicted positions per step
+    pred_energy          : list of (N_a,) arrays — predicted energy per step
+    prey_spatial_spread  : (horizon,) std(x)+std(y) for predicted alive prey
+    pred_spatial_spread  : (horizon,) std(x)+std(y) for predicted alive predators
     """
     T = min(horizon, len(episode) - 1)
 
@@ -67,6 +76,8 @@ def rollout_episode(
     pred_agents_alive = []
     pred_xy_list = []
     pred_energy_list = []
+    prey_spread_list = []
+    pred_spread_list = []
 
     for step in range(T):
         preds = model(agents_t, patches_t)
@@ -88,31 +99,62 @@ def rollout_episode(
         true_pred.append(int(gt_counts[1]))
 
         # Ghost count: predicted alive but GT is dead
-        gt_alive = torch.from_numpy(episode[step + 1][0][:, 5]).to(device)  # (N_a,)
+        gt_alive = torch.from_numpy(episode[step + 1][0][:, 5]).to(device)
         ghost_mask = (alive_hard > 0.5) & (gt_alive < 0.5)
         ghost_counts.append(ghost_mask.sum().item())
 
-        # Save spatial/energy distributions
+        # Save spatial / energy distributions for CURRENT step
         alive_np = alive_hard.cpu().numpy()
+        xy_np    = agents_t[0, :, 1:3].cpu().numpy()   # (N_a, 2) normalised
+        en_np    = agents_t[0, :, 3].cpu().numpy()
         pred_agents_alive.append(alive_np)
-        pred_xy_list.append(agents_t[0, :, 1:3].cpu().numpy())
-        pred_energy_list.append(agents_t[0, :, 3].cpu().numpy())
+        pred_xy_list.append(xy_np)
+        pred_energy_list.append(en_np)
 
-        # Advance state
+        # ── Spatial spread diagnostics ────────────────────────────────────
+        species_np = agents_t[0, :, 0].cpu().numpy()
+        prey_mask = (alive_np > 0.5) & (species_np == SPECIES_PREY)
+        pred_mask = (alive_np > 0.5) & (species_np == SPECIES_PREDATOR)
+
+        prey_xy = xy_np[prey_mask]
+        pred_xy = xy_np[pred_mask]
+
+        if len(prey_xy) > 1:
+            prey_spread = float(np.std(prey_xy[:, 0]) + np.std(prey_xy[:, 1]))
+        else:
+            prey_spread = 0.0
+        if len(pred_xy) > 1:
+            pred_spread_val = float(np.std(pred_xy[:, 0]) + np.std(pred_xy[:, 1]))
+        else:
+            pred_spread_val = 0.0
+
+        prey_spread_list.append(prey_spread)
+        pred_spread_list.append(pred_spread_val)
+
+        if prey_spread < 0.05 and step < 5 and len(prey_xy) > 1:
+            print(f"WARNING: Spatial collapse detected at step {step} "
+                  f"— prey spread={prey_spread:.3f}")
+
+        # Advance state (hard argmax movement, no grad)
         agents_t, patches_t = apply_predictions_to_state(
-            agents_t, patches_t, preds, threshold
+            agents_t, patches_t, preds,
+            threshold=threshold,
+            grid_size=model_cfg.grid_size,
+            soft=False,
         )
 
     return {
-        "pred_prey":    np.array(pred_prey),
-        "pred_pred":    np.array(pred_pred),
-        "true_prey":    np.array(true_prey),
-        "true_pred":    np.array(true_pred),
-        "ghost_counts": np.array(ghost_counts),
-        "attn_last":    attn_last,
-        "pred_agents_alive": pred_agents_alive,
-        "pred_xy":      pred_xy_list,
-        "pred_energy":  pred_energy_list,
+        "pred_prey":           np.array(pred_prey),
+        "pred_pred":           np.array(pred_pred),
+        "true_prey":           np.array(true_prey),
+        "true_pred":           np.array(true_pred),
+        "ghost_counts":        np.array(ghost_counts),
+        "attn_last":           attn_last,
+        "pred_agents_alive":   pred_agents_alive,
+        "pred_xy":             pred_xy_list,
+        "pred_energy":         pred_energy_list,
+        "prey_spatial_spread": np.array(prey_spread_list),
+        "pred_spatial_spread": np.array(pred_spread_list),
     }
 
 
@@ -188,17 +230,16 @@ def run_rollout_evaluation(
     all_spatial_kl, all_energy_kl = [], []
     stability_count = 0
     all_ghost_counts = []
+    all_prey_spread, all_pred_spread = [], []
 
-    traj_episode_result = None  # for trajectory plot
+    traj_episode_result = None
 
     for ep_idx, episode in enumerate(selected):
-        res = rollout_episode(model, episode, horizon, device)
+        res = rollout_episode(model, episode, horizon, device, model_cfg)
 
-        # Population correlations
         all_prey_r.append(safe_pearsonr(res["pred_prey"], res["true_prey"]))
         all_pred_r.append(safe_pearsonr(res["pred_pred"], res["true_pred"]))
 
-        # Extinction detection (within ±5 steps)
         for species_name, pred_counts, true_counts, det_ctr, tot_ctr in [
             ("prey",  res["pred_prey"], res["true_prey"],
              extinction_detected_prey, extinction_total_prey),
@@ -218,7 +259,7 @@ def run_rollout_evaluation(
                     extinction_detected_pred = det_ctr
                     extinction_total_pred = tot_ctr
 
-        # Spatial and energy KL at step 20 (if available)
+        # Spatial and energy KL at step 20
         t20 = min(19, len(res["pred_xy"]) - 1)
         alive_np = res["pred_agents_alive"][t20]
         pred_xy  = res["pred_xy"][t20][alive_np > 0.5]
@@ -231,16 +272,18 @@ def run_rollout_evaluation(
         true_en = true_agents_t20[true_alive, 3]
         all_energy_kl.append(energy_kl(pred_en, true_en))
 
-        # Stability: non-zero and non-exploding population
+        # Stability check
         max_pop = max(res["pred_prey"].max(), res["pred_pred"].max())
         min_pop = min(res["pred_prey"].min(), res["pred_pred"].min())
         if min_pop >= 0 and max_pop < 1000:
             stability_count += 1
 
-        # Ghost counts
         all_ghost_counts.extend(res["ghost_counts"].tolist())
 
-        # Save first episode for trajectory plot
+        # Spatial spread (mean across all rollout steps)
+        all_prey_spread.append(float(res["prey_spatial_spread"].mean()))
+        all_pred_spread.append(float(res["pred_spatial_spread"].mean()))
+
         if ep_idx == 0:
             traj_episode_result = res
 
@@ -250,13 +293,15 @@ def run_rollout_evaluation(
     )
 
     metrics = {
-        "rollout/pop_correlation_prey":   float(np.mean(all_prey_r)),
-        "rollout/pop_correlation_pred":   float(np.mean(all_pred_r)),
-        "rollout/extinction_detection":   ext_rate,
-        "rollout/spatial_kl_t20":         float(np.mean(all_spatial_kl)),
-        "rollout/energy_kl_t20":          float(np.mean(all_energy_kl)),
-        "rollout/stability_rate":         stability_count / n_ep,
-        "rollout/mean_ghost_count":       float(np.mean(all_ghost_counts)),
+        "rollout/pop_correlation_prey":      float(np.mean(all_prey_r)),
+        "rollout/pop_correlation_pred":      float(np.mean(all_pred_r)),
+        "rollout/extinction_detection":      ext_rate,
+        "rollout/spatial_kl_t20":           float(np.mean(all_spatial_kl)),
+        "rollout/energy_kl_t20":            float(np.mean(all_energy_kl)),
+        "rollout/stability_rate":            stability_count / n_ep,
+        "rollout/mean_ghost_count":          float(np.mean(all_ghost_counts)),
+        "rollout/mean_prey_spatial_spread":  float(np.mean(all_prey_spread)),
+        "rollout/mean_pred_spatial_spread":  float(np.mean(all_pred_spread)),
         "epoch": epoch,
     }
 
@@ -276,14 +321,13 @@ def run_rollout_evaluation(
             xname="step",
         )
 
-    # Attention heatmap (last layer, first head, first N agents)
+    # Attention heatmap
     if traj_episode_result is not None and traj_episode_result["attn_last"] is not None:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        attn = traj_episode_result["attn_last"]  # (H, N, N)
-        # Show mean across heads, first 50 tokens (for readability)
+        attn = traj_episode_result["attn_last"]   # (H, N, N)
         attn_mean = attn.mean(axis=0)[:50, :50]
         fig, ax = plt.subplots(figsize=(8, 6))
         im = ax.imshow(attn_mean, cmap="viridis", aspect="auto")
@@ -299,4 +343,5 @@ def run_rollout_evaluation(
     print(f"  [Rollout eval] prey_r={metrics['rollout/pop_correlation_prey']:.3f} | "
           f"pred_r={metrics['rollout/pop_correlation_pred']:.3f} | "
           f"stability={metrics['rollout/stability_rate']:.2f} | "
-          f"ghosts={metrics['rollout/mean_ghost_count']:.1f}")
+          f"ghosts={metrics['rollout/mean_ghost_count']:.1f} | "
+          f"prey_spread={metrics['rollout/mean_prey_spatial_spread']:.3f}")
