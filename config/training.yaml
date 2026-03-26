@@ -1,0 +1,58 @@
+# WM-3 training configuration — optimizers, losses, scheduling.
+
+seed: 42
+
+batch:
+  size: 16
+  seq_len: 50              # trajectory length per training sequence
+  prefill: 5000            # random-policy steps before training begins
+
+optimizer:
+  world_model:             # applied to model.phi.parameters()
+    type: adam
+    lr: 1.0e-4
+    eps: 1.0e-8
+    weight_decay: 0.0
+    max_grad_norm: 100.0
+
+  actor:
+    type: adam
+    lr: 3.0e-5
+    eps: 1.0e-8
+    max_grad_norm: 100.0
+
+  critic:
+    type: adam
+    lr: 3.0e-5
+    eps: 1.0e-8
+    max_grad_norm: 100.0
+
+loss_weights:
+  decoder: 1.0
+  reward: 1.0
+  continue: 1.0
+  kl: 0.5                  # β for KL(posterior ‖ prior)
+
+kl:
+  free_bits: 1.0           # per-dimension free-bits threshold (nats)
+  balance: 0.8             # fraction of KL gradient sent to posterior vs prior
+
+lambda_return:
+  gamma: 0.997             # discount factor
+  lam: 0.95                # GAE-λ for bootstrapped return estimation
+
+schedule:
+  total_steps: 1_000_000
+  warmup_steps: 1000       # linear LR warmup for world-model optimizer
+  log_every: 250
+  eval_every: 10_000
+  checkpoint_every: 50_000
+
+replay_buffer:
+  capacity: 1_000_000
+  min_episodes: 1
+  prioritized: false
+
+mixed_precision:
+  enabled: false
+  dtype: float16

@@ -1,0 +1,49 @@
+# WM-3 environment configuration — predator-prey ecosystem.
+
+name: predator_prey
+version: "1.0"
+
+grid:
+  width: 64
+  height: 64
+  channels: 3               # RGB observation
+  wrap: true                 # toroidal boundaries
+
+agents:
+  num_predators: 2
+  num_prey: 3
+  max_agents: 8              # upper bound for dynamic population / padding
+  obs_radius: 7              # grid cells visible per agent (local patch)
+  scalar_features: 16        # per-agent scalar observation dim (health, hunger, age, …)
+
+actions:
+  type: discrete
+  num_actions: 5             # noop, up, down, left, right
+  action_encoding: one_hot
+
+rewards:
+  predator:
+    catch: 10.0
+    step_penalty: -0.01
+    starvation: -1.0         # applied when hunger reaches zero
+  prey:
+    survive_step: 0.1
+    eaten: -10.0
+    reach_food: 1.0
+
+dynamics:
+  predator_speed: 1          # cells per step
+  prey_speed: 1
+  catch_radius: 1            # Chebyshev distance for a successful catch
+  respawn: true              # prey respawn after cooldown
+  respawn_cooldown: 20       # steps before a caught prey reappears
+  food_spawn_rate: 0.05      # probability of new food cell per step
+
+episode:
+  max_steps: 500
+  terminate_on_all_caught: false   # episode continues even if all prey caught once
+
+rendering:
+  enabled: false
+  fps: 10
+  cell_size: 8              # pixels per grid cell for visualization
