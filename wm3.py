@@ -288,11 +288,13 @@ class Heads(nn.Module):
         B = s.shape[0]
 
         dec = self.decoder_cnn(self.decoder_fc(s).view(B, 256, 4, 4))
+        cont_logits = self.cont_net(s)
 
         return {
             "decoder":      dec,                                # (B, 3, 64, 64)
             "reward":       self.reward_net(s),                 # (B, 1)
-            "cont":         torch.sigmoid(self.cont_net(s)),    # (B, 1)
+            "cont_logits":  cont_logits,                        # (B, 1) raw logits
+            "cont":         torch.sigmoid(cont_logits),         # (B, 1) probability
             "critic":       self.critic_net(s_sg),              # (B, 1)
             "actor_logits": self.actor_net(s_sg),               # (B, act_dim)
         }
@@ -429,7 +431,7 @@ class WorldModel(nn.Module):
                 cont   (B, T, 1)
         """
         buf: Dict[str, List[Tensor]] = {
-            k: [] for k in ("h", "z", "s", "a", "reward", "cont")
+            k: [] for k in ("h", "z", "s", "a", "reward", "cont_logits", "cont")
         }
 
         for _ in range(horizon):
@@ -443,7 +445,9 @@ class WorldModel(nn.Module):
             buf["s"].append(s)
             buf["a"].append(a)
             buf["reward"].append(self.heads.reward_net(s))
-            buf["cont"].append(torch.sigmoid(self.heads.cont_net(s)))
+            cont_logits = self.heads.cont_net(s)
+            buf["cont_logits"].append(cont_logits)
+            buf["cont"].append(torch.sigmoid(cont_logits))
 
             h, z, _ = self.rssm.prior_step(h, z, a)
 

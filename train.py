@@ -14,6 +14,7 @@ The script implements the full Dreamer training loop:
 from __future__ import annotations
 
 import argparse
+import copy
 import logging
 import random
 from dataclasses import dataclass, field
@@ -30,6 +31,12 @@ import yaml
 
 from wm3 import WorldModel, symlog, symexp
 from losses import lambda_return, symlog as symlog_loss
+
+
+def soft_update(target: nn.Module, source: nn.Module, tau: float) -> None:
+    """Soft update target network parameters: θ_target = τ*θ_source + (1-τ)*θ_target."""
+    for target_param, source_param in zip(target.parameters(), source.parameters()):
+        target_param.data.copy_(tau * source_param.data + (1.0 - tau) * target_param.data)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -103,6 +110,9 @@ class Config:
 
     # Actor entropy bonus
     entropy_coef: float = 3e-4
+
+    # Critic EMA target network
+    critic_ema_tau: float = 0.02
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "Config":
@@ -313,8 +323,9 @@ def world_model_step(
         reward_pred = preds["reward"].squeeze(-1)
         reward_loss = F.mse_loss(reward_pred, symlog(target_reward))
 
-        cont_logits = torch.logit(preds["cont"].squeeze(-1).clamp(1e-6, 1 - 1e-6))
-        cont_loss = F.binary_cross_entropy_with_logits(cont_logits, target_cont)
+        cont_loss = F.binary_cross_entropy_with_logits(
+            preds["cont_logits"].squeeze(-1), target_cont
+        )
 
         kl_loss, kl_raw = categorical_kl_divergence(
             post_logits, prior_logits,
@@ -421,6 +432,7 @@ def actor_critic_step(
     model: WorldModel,
     traj: Dict[str, Tensor],
     config: Config,
+    critic_target: Optional[nn.Module] = None,
 ) -> Tuple[Tensor, Tensor, Dict[str, Tensor]]:
     """Compute actor and critic losses on imagined trajectories.
 
@@ -428,6 +440,7 @@ def actor_critic_step(
         model: WorldModel instance
         traj: imagined trajectory dict
         config: training configuration
+        critic_target: optional EMA target network for stable value estimation
 
     Returns:
         actor_loss: scalar actor loss
@@ -437,12 +450,14 @@ def actor_critic_step(
     states = traj["states"]
     rewards = traj["rewards"]
     continues = traj["continues"]
+    sampled_actions = traj["actions"]
 
     H, B = rewards.shape
 
+    target_critic = critic_target if critic_target is not None else model.heads.critic_net
     with torch.no_grad():
-        values = model.heads.critic_net(states).squeeze(-1)
-        bootstrap = model.heads.critic_net(states[-1:]).squeeze(-1)
+        values = target_critic(states).squeeze(-1)
+        bootstrap = target_critic(states[-1:]).squeeze(-1)
         values_with_bootstrap = torch.cat([values, bootstrap], dim=0)
 
     lambda_returns = lambda_return(
@@ -461,7 +476,9 @@ def actor_critic_step(
     action_dist = torch.distributions.Categorical(logits=actor_logits)
     entropy = action_dist.entropy()
 
-    actor_loss = -returns_norm.mean() - config.entropy_coef * entropy.mean()
+    action_indices = sampled_actions.argmax(dim=-1)
+    log_probs = action_dist.log_prob(action_indices)
+    actor_loss = -(log_probs * returns_norm.detach()).mean() - config.entropy_coef * entropy.mean()
 
     critic_values = model.heads.critic_net(states.detach()).squeeze(-1)
     critic_loss = F.mse_loss(critic_values, lambda_returns.detach())
@@ -470,6 +487,7 @@ def actor_critic_step(
         "loss/actor": actor_loss.detach(),
         "loss/critic": critic_loss.detach(),
         "actor/entropy": entropy.mean().detach(),
+        "actor/log_prob_mean": log_probs.mean().detach(),
         "actor/returns_mean": returns_mean.detach(),
         "actor/returns_std": returns_std.detach(),
         "critic/value_mean": critic_values.mean().detach(),
@@ -500,6 +518,7 @@ def save_checkpoint(
     opt_wm: torch.optim.Optimizer,
     opt_actor: torch.optim.Optimizer,
     opt_critic: torch.optim.Optimizer,
+    critic_target: nn.Module,
     step: int,
     metrics: Dict[str, float],
 ) -> None:
@@ -512,6 +531,7 @@ def save_checkpoint(
             "opt_wm_state_dict": opt_wm.state_dict(),
             "opt_actor_state_dict": opt_actor.state_dict(),
             "opt_critic_state_dict": opt_critic.state_dict(),
+            "critic_target_state_dict": critic_target.state_dict(),
             "metrics": metrics,
         },
         path,
@@ -525,6 +545,7 @@ def load_checkpoint(
     opt_wm: torch.optim.Optimizer,
     opt_actor: torch.optim.Optimizer,
     opt_critic: torch.optim.Optimizer,
+    critic_target: nn.Module,
 ) -> int:
     """Load training checkpoint. Returns the step number."""
     checkpoint = torch.load(path, map_location="cpu")
@@ -532,6 +553,8 @@ def load_checkpoint(
     opt_wm.load_state_dict(checkpoint["opt_wm_state_dict"])
     opt_actor.load_state_dict(checkpoint["opt_actor_state_dict"])
     opt_critic.load_state_dict(checkpoint["opt_critic_state_dict"])
+    if "critic_target_state_dict" in checkpoint:
+        critic_target.load_state_dict(checkpoint["critic_target_state_dict"])
     logger.info(f"Loaded checkpoint from {path} at step {checkpoint['step']}")
     return checkpoint["step"]
 
@@ -599,6 +622,10 @@ class Trainer:
             eps=config.critic_eps,
         )
 
+        self.critic_target = copy.deepcopy(self.model.heads.critic_net)
+        for param in self.critic_target.parameters():
+            param.requires_grad = False
+
         self.scheduler_wm = get_lr_scheduler(
             self.opt_wm, config.warmup_steps, config.total_steps
         )
@@ -660,7 +687,7 @@ class Trainer:
                 self.model, batch, self.config.imagination_horizon, self.device
             )
             actor_loss, critic_loss, ac_metrics = actor_critic_step(
-                self.model, traj, self.config
+                self.model, traj, self.config, critic_target=self.critic_target
             )
 
         self.opt_actor.zero_grad()
@@ -682,6 +709,8 @@ class Trainer:
         self.scaler.step(self.opt_critic)
 
         self.scaler.update()
+
+        soft_update(self.critic_target, self.model.heads.critic_net, self.config.critic_ema_tau)
 
         metrics = {**wm_metrics, **ac_metrics}
         metrics["lr/wm"] = self.opt_wm.param_groups[0]["lr"]
@@ -725,6 +754,7 @@ class Trainer:
                     self.opt_wm,
                     self.opt_actor,
                     self.opt_critic,
+                    self.critic_target,
                     self.step,
                     metrics,
                 )
@@ -736,6 +766,7 @@ class Trainer:
             self.opt_wm,
             self.opt_actor,
             self.opt_critic,
+            self.critic_target,
             self.step,
             metrics,
         )
@@ -781,6 +812,7 @@ def main():
             trainer.opt_wm,
             trainer.opt_actor,
             trainer.opt_critic,
+            trainer.critic_target,
         )
 
     trainer.train()
