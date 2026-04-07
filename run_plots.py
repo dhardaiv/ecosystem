@@ -19,6 +19,7 @@ import numpy as np
 import torch
 
 from losses import lambda_return, symlog, symlog_inv
+from train import Config, world_model_step
 from wm3 import WorldModel
 
 
@@ -213,11 +214,76 @@ def plot_loss_per_iteration(out_dir: Path) -> None:
     plt.close()
 
 
+def plot_loss_overfit_dataset(out_dir: Path) -> None:
+    """Train WM-3 on the fixed overfit dataset (learnable structure, not noise)."""
+    data_path = Path(__file__).resolve().parent / "data" / "overfit_dataset.pt"
+    if not data_path.is_file():
+        raise FileNotFoundError(
+            f"Missing {data_path}; run: python3 data/generate_overfit.py"
+        )
+
+    raw = torch.load(data_path, map_location="cpu")
+    rewards = raw["rewards"]
+    continues = raw["continues"]
+    if rewards.dim() == 3:
+        rewards = rewards.squeeze(-1)
+    if continues.dim() == 3:
+        continues = continues.squeeze(-1)
+
+    batch = {
+        "grids": raw["obs_grid"].float(),
+        "scalars": raw["obs_scalars"].float(),
+        "actions": raw["actions"].float(),
+        "rewards": rewards.float(),
+        "continues": continues.float(),
+    }
+
+    torch.manual_seed(0)
+    device = torch.device("cpu")
+    act_dim = batch["actions"].shape[-1]
+    model = WorldModel(act_dim=act_dim).to(device).train()
+    opt = torch.optim.Adam(model.parameters(), lr=3e-4)
+
+    config = Config()
+    iters = 200
+
+    totals, recons, rews, conts, kls = [], [], [], [], []
+
+    for _ in range(iters):
+        loss, metrics = world_model_step(model, batch, config)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+
+        totals.append(metrics["loss/wm_total"].item())
+        recons.append(metrics["loss/recon"].item())
+        rews.append(metrics["loss/reward"].item())
+        conts.append(metrics["loss/continue"].item())
+        kls.append(metrics["loss/kl"].item())
+
+    xs = np.arange(iters)
+    plt.figure(figsize=(8, 4))
+    plt.plot(xs, totals, label="total")
+    plt.plot(xs, recons, label="recon", alpha=0.85)
+    plt.plot(xs, rews, label="reward", alpha=0.85)
+    plt.plot(xs, conts, label="continue", alpha=0.85)
+    plt.plot(xs, np.array(kls) * config.kl_weight, label=f"β·KL (β={config.kl_weight})", alpha=0.85)
+    plt.title("WM-3 training on overfit_dataset.pt (structured synthetic data)")
+    plt.xlabel("iteration")
+    plt.ylabel("loss")
+    plt.grid(True, alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_dir / "loss_overfit_dataset.png", dpi=200)
+    plt.close()
+
+
 def main() -> None:
     out_dir = _ensure_dir(Path(__file__).resolve().parent / "plots")
     plot_symlog(out_dir)
     plot_lambda_return(out_dir)
     plot_loss_per_iteration(out_dir)
+    plot_loss_overfit_dataset(out_dir)
     print(f"Wrote plots to: {out_dir}")
 
 
